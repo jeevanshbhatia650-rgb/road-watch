@@ -1,66 +1,126 @@
-# ai-service/main.py — RoadWatch AI Microservice
-# Structured for future YOLO/OpenCV integration
-
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
 from models.predictor import PotholePredictor
-from utils.image_processor import preprocess_image
+from utils.llm_reporter import generate_report
+import shutil, os, uuid
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(
     title="RoadWatch AI Service",
-    description="Pothole & road damage detection microservice",
-    version="1.0.0"
+    description="Road damage detection from images and dashcam video",
+    version="2.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-# Initialize model at startup
 predictor = PotholePredictor()
-
-@app.on_event("startup")
-async def startup_event():
-    """Load model weights on startup."""
-    predictor.load_model()
-    print("✅ AI model loaded successfully")
+predictor.load_model()
 
 
 @app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "RoadWatch AI", "model_loaded": predictor.is_loaded}
+def health():
+    return {
+        "status":       "ok",
+        "model_loaded": predictor.is_loaded,
+        "classes":      list(predictor.model.names.values())
+    }
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict_image(
+    image: UploadFile = File(...),
+    lat:   float      = Form(...),
+    lng:   float      = Form(...)
+):
+    """Single image → detection + report"""
+    temp_path = f"/tmp/{uuid.uuid4()}.jpg"
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(image.file, f)
+
+    try:
+        detection_result = predictor.predict(temp_path)
+        report = await generate_report(
+            detection_result=detection_result,
+            location={"lat": lat, "lng": lng}
+        )
+        return {
+            "success":    True,
+            "mode":       "image",
+            "detections": detection_result,
+            "report":     report,
+            "ministry":   report["assigned_ministry"],
+            "priority":   report["priority_code"],
+            "severity":   detection_result["severity"]
+        }
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+@app.post("/predict-video")
+async def predict_video(
+    video:              UploadFile = File(...),
+    lat:                float      = Form(...),
+    lng:                float      = Form(...),
+    sample_every_frames: int       = Form(30)
+):
     """
-    Analyze road image and return damage prediction.
-    
-    Returns:
-        issue_type: Type of road damage detected
-        severity:   Severity level (Low / Medium / High / Critical)
-        confidence: Model confidence score 0-1
+    Dashcam video file → detections + single consolidated report.
+
+    - Samples 1 frame every `sample_every_frames` frames
+    - Deduplicates repeated detections of same damage
+    - Generates one government report summarising entire journey
+    - lat/lng = starting GPS coords of the video recording
     """
-    # Validate file type
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    # Save uploaded video to temp file
+    ext       = os.path.splitext(video.filename)[1] or ".mp4"
+    temp_path = f"/tmp/{uuid.uuid4()}{ext}"
 
-    # Read and preprocess image
-    contents = await file.read()
-    image = preprocess_image(contents)
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(video.file, f)
 
-    if image is None:
-        raise HTTPException(status_code=400, detail="Could not process image")
+    try:
+        print(f"[/predict-video] Processing {video.filename} ...")
 
-    # Run prediction
-    result = predictor.predict(image)
-    return result
+        detection_result = predictor.predict_video(
+            video_path=temp_path,
+            lat=lat,
+            lng=lng,
+            sample_every_n_frames=sample_every_frames
+        )
 
+        if detection_result["total_found"] == 0:
+            return {
+                "success":    True,
+                "mode":       "video",
+                "message":    "No road damage detected in video",
+                "detections": detection_result
+            }
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        # One consolidated report for the whole video
+        report = await generate_report(
+            detection_result=detection_result,
+            location={"lat": lat, "lng": lng}
+        )
+
+        return {
+            "success":    True,
+            "mode":       "video",
+            "video_meta": detection_result["video_meta"],
+            "detections": detection_result,
+            "report":     report,
+            "ministry":   report["assigned_ministry"],
+            "priority":   report["priority_code"],
+            "severity":   detection_result["severity"]
+        }
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
